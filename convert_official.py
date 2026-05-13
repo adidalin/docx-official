@@ -54,6 +54,11 @@ def clean_text(text):
     text = text.replace('\ufeff', '')    # BOM
     text = text.replace('\t', ' ')       # 制表符
 
+    # 去除Markdown符号（#、*、>）
+    text = re.sub(r'^#{1,6}\s*', '', text)  # 去除标题#
+    text = text.replace('*', '')            # 去除加粗*
+    text = re.sub(r'^>\s*', '', text)       # 去除引用>
+
     # 去除多余空格（保留单个空格）
     text = re.sub(r' {2,}', ' ', text)
 
@@ -187,9 +192,9 @@ def correct_text_with_api(texts, api_key=None):
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.1,
-                "max_tokens": 2000
+                "max_tokens": 8000
             },
-            timeout=60
+            timeout=120
         )
 
         result = response.json()
@@ -206,7 +211,31 @@ def correct_text_with_api(texts, api_key=None):
         elif "```" in raw_text:
             raw_text = raw_text.split("```")[1].split("```")[0]
 
-        data = json.loads(raw_text)
+        # 清理JSON文本
+        raw_text = raw_text.strip()
+        # 移除可能的BOM和控制字符
+        raw_text = re.sub(r'[\ufeff]', '', raw_text)
+        
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as e:
+            print(f"JSON解析失败: {e}")
+            print(f"原始文本前500字符: {raw_text[:500]}")
+            # 尝试修复常见JSON问题
+            # 1. 尝试找到第一个{和最后一个}
+            start = raw_text.find('{')
+            end = raw_text.rfind('}')
+            if start != -1 and end != -1:
+                raw_text = raw_text[start:end+1]
+                try:
+                    data = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    print("JSON修复失败，跳过纠错")
+                    return texts, []
+            else:
+                print("未找到有效JSON结构，跳过纠错")
+                return texts, []
+        
         corrections = data.get('corrections', [])
 
         if not corrections:
@@ -302,9 +331,9 @@ def analyze_with_api(texts, api_key=None):
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.1,
-                "max_tokens": 2000
+                "max_tokens": 8000
             },
-            timeout=60
+            timeout=120
         )
 
         result = response.json()
@@ -321,7 +350,30 @@ def analyze_with_api(texts, api_key=None):
         elif "```" in raw_text:
             raw_text = raw_text.split("```")[1].split("```")[0]
 
-        data = json.loads(raw_text)
+        # 清理JSON文本
+        raw_text = raw_text.strip()
+        # 移除可能的BOM和控制字符
+        raw_text = re.sub(r'[\ufeff]', '', raw_text)
+        
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as e:
+            print(f"JSON解析失败: {e}")
+            print(f"原始文本前500字符: {raw_text[:500]}")
+            # 尝试修复常见JSON问题
+            # 1. 尝试找到第一个{和最后一个}
+            start = raw_text.find('{')
+            end = raw_text.rfind('}')
+            if start != -1 and end != -1:
+                raw_text = raw_text[start:end+1]
+                try:
+                    data = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    print("JSON修复失败，使用规则判断")
+                    return None
+            else:
+                print("未找到有效JSON结构，使用规则判断")
+                return None
 
         # 构建sections：使用API的type分类，但使用原始cleaned_texts的文本
         types_map = {}
