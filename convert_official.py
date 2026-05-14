@@ -40,6 +40,18 @@ SIZE_PAGE_NUM = 14   # 四号
 LINE_SPACING = 28   # 公文固定行距28磅
 
 
+def _escape_json_newlines(s):
+    """转义JSON字符串值中的literal换行符，修复DeepSeek偶尔返回未转义换行的问题"""
+    out, in_str, esc = [], False, False
+    for ch in s:
+        if esc: esc = False; out.append(ch); continue
+        if ch == '\\': esc = True; out.append(ch); continue
+        if ch == '"': in_str = not in_str; out.append(ch); continue
+        if in_str and ch in '\n\r': out.append('\\n'); continue
+        out.append(ch)
+    return ''.join(out)
+
+
 def clean_text(text):
     """清洗文本：去除多余空格、处理从网页复制的特殊字符"""
     if not text:
@@ -166,6 +178,7 @@ def correct_text_with_api(texts, api_key=None):
 - 只修改确实有错误的地方，不要改变原文的表述风格
 - 不要修改专业术语或特定表述
 - 不要添加原文没有的内容
+- 修正后的文本必须保持在同一行内，不要使用换行符或分段
 
 段落列表：
 {content}
@@ -213,16 +226,17 @@ def correct_text_with_api(texts, api_key=None):
 
         # 清理JSON文本
         raw_text = raw_text.strip()
-        # 移除可能的BOM和控制字符
         raw_text = re.sub(r'[\ufeff]', '', raw_text)
-        
+
+        # 预处理：转义JSON字符串中的literal换行符（DeepSeek有时会返回未转义的换行）
+        raw_text = _escape_json_newlines(raw_text)
+
         try:
             data = json.loads(raw_text)
         except json.JSONDecodeError as e:
             print(f"JSON解析失败: {e}")
             print(f"原始文本前500字符: {raw_text[:500]}")
-            # 尝试修复常见JSON问题
-            # 1. 尝试找到第一个{和最后一个}
+            # 尝试修复：找到第一个{和最后一个}
             start = raw_text.find('{')
             end = raw_text.rfind('}')
             if start != -1 and end != -1:
@@ -352,16 +366,14 @@ def analyze_with_api(texts, api_key=None):
 
         # 清理JSON文本
         raw_text = raw_text.strip()
-        # 移除可能的BOM和控制字符
         raw_text = re.sub(r'[\ufeff]', '', raw_text)
+        raw_text = _escape_json_newlines(raw_text)
         
         try:
             data = json.loads(raw_text)
         except json.JSONDecodeError as e:
             print(f"JSON解析失败: {e}")
             print(f"原始文本前500字符: {raw_text[:500]}")
-            # 尝试修复常见JSON问题
-            # 1. 尝试找到第一个{和最后一个}
             start = raw_text.find('{')
             end = raw_text.rfind('}')
             if start != -1 and end != -1:
@@ -585,6 +597,165 @@ def add_page_numbers(doc):
         rFonts_s2.set(qn('w:eastAsia'), '宋体')
 
 
+def split_long_headings_with_api(sections, api_key=None, max_length=40):
+    """使用API智能拆分过长的标题，确保拆分后语意通顺、结构完整"""
+    if not api_key:
+        api_key = API_KEY
+
+    long_items = []
+    for item in sections:
+        text = item.get('text', '')
+        ptype = item.get('type', 'body')
+        if ptype in ('h1', 'h2') and len(text) > max_length:
+            long_items.append(item)
+
+    if not long_items:
+        return sections
+
+    text_list = []
+    for item in long_items:
+        text_list.append({"index": sections.index(item), "text": item['text']})
+
+    content = json.dumps(text_list, ensure_ascii=False, indent=2)
+
+    prompt = f"""以下文档段落被识别为标题（一级"一、二、"或二级"（一）（二）"等），但内容过长。
+请为每个标题确定一个合理的截断位置，将其拆分为：
+1. 简洁的标题（保留序号+核心语义）
+2. 正文内容（从截断处开始，确保语句通顺完整）
+
+要求：
+- 标题要简洁、完整，保留序号（如"一、"或"（一）"）
+- 正文部分从截断处开始，去掉前导标点，保持语句通顺
+- 如果原文在截断处断开后可能不通顺，可微调用词使之通顺
+- 不要添加原文没有的新内容
+- 不要改变原文的意思
+
+段落列表：
+{content}
+
+输出JSON格式（只列出需要拆分的段落）：
+{{
+  "splits": [
+    {{
+      "index": 段落索引,
+      "heading": "拆分后的标题（含序号）",
+      "body": "拆分后的正文内容"
+    }}
+  ]
+}}
+
+如果没有需要拆分的或无需修改，返回：{{"splits": []}}
+只输出JSON，不要其他内容。"""
+
+    try:
+        print("调用DeepSeek API智能拆分过长标题...")
+        response = requests.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": "你是文档结构优化专家。只输出JSON，不要输出任何解释。拆分标题时确保语意通顺、结构完整。"},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 4000
+            },
+            timeout=120
+        )
+
+        result = response.json()
+        if "error" in result:
+            print(f"API错误: {result['error']['message']}")
+            return split_long_headings(sections, max_length)
+
+        raw_text = result["choices"][0]["message"]["content"].strip()
+        if "```json" in raw_text:
+            raw_text = raw_text.split("```json")[1].split("```")[0]
+        elif "```" in raw_text:
+            raw_text = raw_text.split("```")[1].split("```")[0]
+        raw_text = re.sub(r'[\ufeff]', '', raw_text).strip()
+        raw_text = _escape_json_newlines(raw_text)
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            start = raw_text.find('{')
+            end = raw_text.rfind('}')
+            if start != -1 and end != -1:
+                try:
+                    data = json.loads(raw_text[start:end+1])
+                except json.JSONDecodeError:
+                    print("JSON解析失败，使用规则截断")
+                    return split_long_headings(sections, max_length)
+            else:
+                print("未找到有效JSON，使用规则截断")
+                return split_long_headings(sections, max_length)
+
+        splits = data.get('splits', [])
+        if not splits:
+            print("API未建议拆分，使用规则截断")
+            return split_long_headings(sections, max_length)
+
+        result_sections = []
+        split_indices = {s['index'] for s in splits}
+        for i, item in enumerate(sections):
+            if i in split_indices:
+                s = next(s for s in splits if s['index'] == i)
+                result_sections.append({"index": item['index'], "type": item['type'], "text": s['heading'].strip()})
+                result_sections.append({"index": item['index'] + 0.1, "type": 'body', "text": s['body'].strip()})
+            else:
+                result_sections.append(item)
+
+        print(f"API拆分了 {len(splits)} 个过长标题")
+        return result_sections
+
+    except Exception as e:
+        print(f"API拆分失败: {e}，使用规则截断")
+        return split_long_headings(sections, max_length)
+
+
+def split_long_headings(sections, max_length=40):
+    """将过长的二级标题截断，多余部分转为正文（规则兜底）"""
+    new_sections = []
+    for item in sections:
+        text = item.get('text', '')
+        ptype = item.get('type', 'body')
+
+        if ptype in ('h1', 'h2') and len(text) > max_length:
+            prefix = ''
+            m = re.match(r'^[一二三四五六七八九十]+[、：]?', text)
+            if not m:
+                m = re.match(r'^（[一二三四五六七八九十]+）', text)
+            if m:
+                prefix = m.group()
+            rest = text[len(prefix):]
+
+            split_at = -1
+            for sep in ['。', '；', '：']:
+                pos = rest.find(sep)
+                if pos != -1 and pos < max_length - len(prefix):
+                    split_at = pos + 1
+                    break
+            if split_at == -1 and len(text) > max_length + 10:
+                for sep in ['，', '、']:
+                    pos = rest.find(sep)
+                    if pos != -1 and pos < max_length - len(prefix):
+                        split_at = pos + 1
+                        break
+
+            if split_at > 0:
+                heading = prefix + rest[:split_at]
+                body = rest[split_at:].strip()
+                if body:
+                    new_sections.append({"index": item['index'], "type": ptype, "text": heading.strip()})
+                    new_sections.append({"index": item['index'] + 0.1, "type": 'body', "text": body})
+                    continue
+
+        new_sections.append(item)
+    return new_sections
+
+
 def split_signature_date(text):
     """拆分落款行：如果同时包含单位名称和日期，拆成两行，并转换为阿拉伯数字日期"""
     # 匹配模式：单位名称 + 空格 + 日期
@@ -649,6 +820,158 @@ def convert_chinese_date_to_arabic(date_str):
     return result
 
 
+def analyze_all_with_api(texts, api_key=None):
+    """一次API调用完成：文本纠错 + 结构分析 + 标题拆分，节省API用量"""
+    if not api_key:
+        api_key = API_KEY
+
+    if not api_key:
+        return None, [], None
+
+    text_list = []
+    for i, text in enumerate(texts):
+        if text and len(text) > 2:
+            text_list.append({"index": i, "text": text[:200]})
+
+    if not text_list:
+        return texts, [], None
+
+    content = json.dumps(text_list, ensure_ascii=False, indent=2)
+
+    prompt = f"""请对以下文档段落进行综合分析，一次性完成两项任务：
+
+任务一：文本纠错
+- 检查错别字（同音字、形近字）
+- 检查漏字（缺少必要的字）
+- 检查明显的事实或格式错误
+- 检查标点符号错误
+- 不要修改专业术语，不要添加原文没有的内容
+- 修正后的文本保持在同一行，不要使用换行符
+
+任务二：结构分析
+为每个段落标注类型：
+- "title": 文档主标题（通常是第一行较短、居中的标题行）
+- "h1": 一级标题（以"一、""二、""三、"等开头）
+- "h2": 二级标题（以"（一）""（二）"等开头）
+- "h3": 三级标题（以"1.""2."等开头）
+- "h4": 四级标题（以"（1）""（2）"等开头）
+- "date": 落款日期行（文末"XXXX年X月X日"格式）
+- "signature": 落款单位名称行（文末单位署名）
+- "body": 正文内容（包括标题下的具体说明文字）
+
+段落列表：
+{content}
+
+输出JSON格式（严格按照以下结构）：
+{{
+  "title": "主标题原文（从原文复制，不要修改，如无则填空字符串）",
+  "corrections": [
+    {{"index": 段落索引, "original": "原文片段", "corrected": "修正后片段", "reason": "修改原因"}}
+  ],
+  "types": [
+    {{"index": 0, "type": "段落类型"}},
+    {{"index": 1, "type": "段落类型"}}
+  ]
+}}
+
+注意：
+- corrections 如无需要可为空数组
+- 只输出JSON，不要其他内容"""
+
+    try:
+        print("调用DeepSeek API（一次完成：纠错+结构+拆分）...")
+        response = requests.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": "你是公文处理专家。一次完成文本校对、结构分析和标题优化。只输出JSON。"},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 8000
+            },
+            timeout=180
+        )
+
+        result = response.json()
+        if "error" in result:
+            print(f"API错误: {result['error']['message']}")
+            return texts, [], None
+
+        raw_text = result["choices"][0]["message"]["content"].strip()
+        if "```json" in raw_text:
+            raw_text = raw_text.split("```json")[1].split("```")[0]
+        elif "```" in raw_text:
+            raw_text = raw_text.split("```")[1].split("```")[0]
+        raw_text = re.sub(r'[\ufeff]', '', raw_text).strip()
+        raw_text = _escape_json_newlines(raw_text)
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            start = raw_text.find('{')
+            end = raw_text.rfind('}')
+            if start != -1 and end != -1:
+                try:
+                    data = json.loads(raw_text[start:end+1])
+                except json.JSONDecodeError:
+                    print("JSON解析失败，使用分步模式")
+                    return texts, [], None
+            else:
+                print("未找到有效JSON，使用分步模式")
+                return texts, [], None
+
+        # --- 1. 应用文本纠错 ---
+        corrected_texts = list(texts)
+        changes = []
+        for c in data.get('corrections', []):
+            idx = c.get('index')
+            original = c.get('original', '')
+            corrected = c.get('corrected', '')
+            reason = c.get('reason', '')
+            if idx is not None and idx < len(corrected_texts) and original and original != corrected:
+                if original in corrected_texts[idx]:
+                    corrected_texts[idx] = corrected_texts[idx].replace(original, corrected, 1)
+                    changes.append({'index': idx, 'original': original, 'corrected': corrected, 'reason': reason})
+
+        if changes:
+            print(f"发现并修正了 {len(changes)} 处错误")
+        else:
+            print("未发现明显错误")
+
+        # --- 2. 构建结构 ---
+        types_map = {}
+        for item in data.get('types', []):
+            types_map[item['index']] = item['type']
+
+        sections = []
+        for i, text in enumerate(corrected_texts):
+            ptype = types_map.get(i, 'body')
+            sections.append({"index": i, "type": ptype, "text": text})
+
+        title = data.get('title', '')
+        # 如果API没返回标题，从前3段找可能的标题
+        if not title:
+            for item in sections[:3]:
+                t = item.get('text', '')
+                if 4 < len(t) < 30 and item.get('type') == 'body':
+                    title = t
+                    item['type'] = 'title'
+                    break
+
+        structure = {"title": title, "sections": sections}
+
+        print(f"API分析完成：{len(sections)} 个段落")
+
+        return corrected_texts, changes, structure
+
+    except Exception as e:
+        print(f"综合分析失败: {e}，使用分步模式")
+        return texts, [], None
+
+
 def convert_to_official(input_file, output_file=None, use_api=True):
     """转换为公文格式（无红头，GB/T 9704标准）"""
     if not output_file:
@@ -673,20 +996,32 @@ def convert_to_official(input_file, output_file=None, use_api=True):
     cleaned_texts = normalize_paragraphs(doc)
     print(f"原始段落数: {len(doc.paragraphs)}, 清洗后: {len(cleaned_texts)}")
 
-    # 文本纠错（使用API检查错别字、漏字等）
+    # 综合分析：一次API调用完成纠错+结构
     changes = []
+    structure = None
     if use_api and API_KEY:
-        cleaned_texts, changes = correct_text_with_api(cleaned_texts)
+        cleaned_texts, changes, structure = analyze_all_with_api(cleaned_texts)
 
-    # 分析结构
-    if use_api and API_KEY:
-        structure = analyze_with_api(cleaned_texts)
-    else:
-        structure = None
-
+    # 如果综合分析失败或未启用API，使用分步模式
     if not structure:
-        print("使用规则判断文档结构...")
-        structure = analyze_by_rules(cleaned_texts)
+        if use_api and API_KEY and not changes:
+            cleaned_texts, changes = correct_text_with_api(cleaned_texts)
+        if use_api and API_KEY:
+            structure = analyze_with_api(cleaned_texts)
+        if not structure:
+            print("使用规则判断文档结构...")
+            structure = analyze_by_rules(cleaned_texts)
+
+    # 标题拆分（单独调用API，或规则兜底）
+    if structure and 'sections' in structure:
+        before = len(structure['sections'])
+        if use_api and API_KEY:
+            structure['sections'] = split_long_headings_with_api(structure['sections'])
+        else:
+            structure['sections'] = split_long_headings(structure['sections'])
+        after = len(structure['sections'])
+        if after > before:
+            print(f"共拆分出 {after - before} 个正文段落（从过长标题中）")
 
     # 获取可用字体
     font_title = FONT_TITLE if fonts_status.get('方正小标宋简体') else 'SimSun'
